@@ -1,7 +1,7 @@
 use crate::{db_err, ToduPlugin};
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Category, LabeledError, Signature, Type, Value};
-use todu_db::ToduRow;
+use todu_db::{sort_tree_by_urgency, ToduRow};
 
 const EMPTY_MSGS: &[&str] = &[
     "No todos — add one with: todu add <task>",
@@ -27,7 +27,7 @@ impl SimplePluginCommand for ToduList {
     }
 
     fn extra_description(&self) -> &str {
-        "Subcommands: add, branch, clear, desc, done, due, get, move, pause, priority, pull, remote, reopen, start, stop, tag, title"
+        "Subcommands: add, branch, clear, desc, done, due, get, impact, move, next, pause, priority, pull, remote, reopen, start, stop, tag, title, urgency"
     }
 
     fn signature(&self) -> Signature {
@@ -39,6 +39,7 @@ impl SimplePluginCommand for ToduList {
             )
             .switch("overdue", "Show only overdue tasks", Some('o'))
             .switch("all", "Include archived (done/stopped) todos", Some('a'))
+            .switch("urgency", "Sort by urgency, most urgent first", Some('u'))
             .input_output_type(Type::Nothing, Type::Any)
             .category(Category::Custom("todu".into()))
     }
@@ -52,17 +53,24 @@ impl SimplePluginCommand for ToduList {
     ) -> Result<Value, LabeledError> {
         let overdue: bool = call.has_flag("overdue")?;
         let all: bool = call.has_flag("all")?;
+        let by_urgency: bool = call.has_flag("urgency")?;
         plugin.with_project(engine, call, |db, proj| {
-            let rows = if all {
+            let mut rows = if all {
                 db.get_all_todos(proj)
             } else {
                 db.get_live_todos(proj)
             }
             .map_err(db_err)?;
+            if by_urgency {
+                sort_tree_by_urgency(&mut rows);
+            }
             let span = call.head;
             let result = if overdue {
                 let mut flat = Vec::new();
                 collect_overdue(&rows, &mut flat);
+                if by_urgency {
+                    flat.sort_by(|a, b| b.urgency.total_cmp(&a.urgency));
+                }
                 if flat.is_empty() {
                     Value::string("No overdue todos", span)
                 } else {

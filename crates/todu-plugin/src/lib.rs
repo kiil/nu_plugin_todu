@@ -94,7 +94,8 @@ impl ToduPlugin {
         let mut guard = self.state.lock().unwrap();
         if guard.is_none() {
             let cfg = Config::from_engine(engine);
-            let db = ToduLocalDatabase::open(&cfg.db_path).map_err(db_err)?;
+            let mut db = ToduLocalDatabase::open(&cfg.db_path).map_err(db_err)?;
+            db.set_urgency_coefficients(cfg.urgency.clone());
             *guard = Some((cfg, db));
         }
         let (cfg, db) = guard.as_ref().unwrap();
@@ -125,6 +126,9 @@ impl Plugin for ToduPlugin {
             Box::new(ToduDue),
             Box::new(ToduTag),
             Box::new(ToduPriorityCmd),
+            Box::new(ToduImpact),
+            Box::new(ToduNext),
+            Box::new(ToduUrgency),
             Box::new(ToduMove),
             Box::new(ToduClear),
             #[cfg(feature = "remote")]

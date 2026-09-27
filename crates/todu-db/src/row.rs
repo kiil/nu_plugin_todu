@@ -31,13 +31,17 @@ pub struct ToduRow {
     pub branch: Option<String>,
     /// Source of the task (local/remote)
     pub source: ToduSource,
+    /// Judged impact in `0.0..=1.0`, e.g. from a jev assessment
+    pub impact: Option<f64>,
+    /// Taskwarrior-style urgency score, computed when the row is loaded
+    pub urgency: f64,
     /// Subtasks (if any)
     pub subtasks: Vec<ToduRow>,
 }
 
 impl ToduRow {
     pub(super) const COLS: &'static str =
-        "ptid, priority, status, title, due, desc, pptid, created, tag, source, branch";
+        "ptid, priority, status, title, due, desc, pptid, created, tag, source, branch, impact";
 
     /// Deserializes a SQLite row into a `ToduRow`
     pub(super) fn from_sql(row: &Row) -> SqlResult<Self> {
@@ -56,6 +60,8 @@ impl ToduRow {
             tag: row.get(8)?,
             source: ToduSource::from_str(&row.get::<_, String>(9)?),
             branch: row.get(10)?,
+            impact: row.get(11)?,
+            urgency: 0.0,
             subtasks: Vec::new(),
         })
     }
@@ -146,6 +152,9 @@ impl ToduRow {
         if let Some(ref b) = self.branch {
             rec.push("branch", Value::string(b.clone(), span));
         }
+        if self.status.is_active() {
+            rec.push("urgency", Value::float(self.urgency, span));
+        }
         Value::record(rec, span)
     }
 
@@ -175,6 +184,10 @@ impl ToduRow {
         if let Some(ref desc) = self.desc {
             rec.push("desc", Value::string(desc.clone(), span));
         }
+        if let Some(impact) = self.impact {
+            rec.push("impact", Value::float(impact, span));
+        }
+        rec.push("urgency", Value::float(self.urgency, span));
         rec.push("source", Value::string(self.source.label(), span));
         if let Some(parent) = self.pptid {
             rec.push("parent", Value::int(parent, span));

@@ -6,6 +6,7 @@ mod remote;
 mod row;
 mod source;
 mod status;
+mod urgency;
 
 pub use priority::ToduPriority;
 #[cfg(feature = "remote")]
@@ -13,8 +14,9 @@ pub use remote::ToduRemote;
 pub use row::ToduRow;
 pub use source::ToduSource;
 pub use status::ToduStatus;
+pub use urgency::{UrgencyCoefficients, UrgencyTerm};
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use nu_protocol::ast::{Comparison, Operator};
 #[cfg(feature = "remote")]
 use rusqlite::OptionalExtension;
@@ -58,6 +60,7 @@ pub struct ParsedTodu {
 /// Handle for an open SQLite connection with the todu schema initialized
 pub struct ToduLocalDatabase {
     conn: Connection,
+    urgency: UrgencyCoefficients,
 }
 
 impl ToduLocalDatabase {
@@ -77,9 +80,18 @@ impl ToduLocalDatabase {
                 tag         TEXT,
                 source      TEXT    NOT NULL DEFAULT 'local',
                 deleted_at  INTEGER,
-                branch      TEXT
+                branch      TEXT,
+                impact      REAL
             );",
         )?;
+        let has_impact: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('todos') WHERE name = 'impact')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_impact {
+            conn.execute_batch("ALTER TABLE todos ADD COLUMN impact REAL;")?;
+        }
 
         #[cfg(feature = "remote")]
         conn.execute_batch(
@@ -90,7 +102,10 @@ impl ToduLocalDatabase {
                 PRIMARY KEY (project, type, url)
             );",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            urgency: UrgencyCoefficients::default(),
+        })
     }
 
     /// Opens (or creates) the database file at `path` and initializes the schema
@@ -99,6 +114,16 @@ impl ToduLocalDatabase {
             std::fs::create_dir_all(path.parent().unwrap()).ok();
         }
         Self::init(Connection::open(path)?)
+    }
+
+    /// Replaces the coefficients used to compute urgency
+    pub fn set_urgency_coefficients(&mut self, coeffs: UrgencyCoefficients) {
+        self.urgency = coeffs;
+    }
+
+    /// Returns the coefficients used to compute urgency
+    pub fn urgency_coefficients(&self) -> &UrgencyCoefficients {
+        &self.urgency
     }
 
     /// Returns all non-archived todos in `project` as a nested parent-child tree, sorted by status, priority, then `ptid`
@@ -126,6 +151,7 @@ impl ToduLocalDatabase {
             .query_map(params![project], ToduRow::from_sql)?
             .collect::<SqlResult<Vec<_>>>()?;
         let mut tree = build_tree(flat);
+        urgency::apply_urgency(&mut tree, &self.urgency, Utc::now());
         sort_tree(&mut tree);
         Ok(tree)
     }
@@ -146,9 +172,12 @@ impl ToduLocalDatabase {
             "SELECT {} FROM todos WHERE ptid = ?1 AND project = ?2",
             ToduRow::COLS,
         );
-        self.conn
+        let mut row = self
+            .conn
             .prepare(&sql)?
-            .query_row(params![ptid, project], ToduRow::from_sql)
+            .query_row(params![ptid, project], ToduRow::from_sql)?;
+        row.urgency = row.compute_urgency(&self.urgency, Utc::now());
+        Ok(row)
     }
 
     /// Returns a single todo item with its full subtask tree, whether archived or not
@@ -327,6 +356,15 @@ impl ToduLocalDatabase {
         Ok(())
     }
 
+    /// Updates the judged impact of todo `ptid`. Values are clamped to `0.0..=1.0`
+    pub fn update_impact(&self, ptid: i64, project: &str, impact: Option<f64>) -> SqlResult<()> {
+        self.conn.execute(
+            "UPDATE todos SET impact = ?1 WHERE ptid = ?2 AND project = ?3",
+            params![impact.map(|i| i.clamp(0.0, 1.0)), ptid, project],
+        )?;
+        Ok(())
+    }
+
     /// Updates the parent of todo `ptid`. Pass `None` to make it a root-level task
     pub fn update_parent(&self, ptid: i64, project: &str, pptid: Option<i64>) -> SqlResult<()> {
         self.conn.execute(
@@ -431,9 +469,23 @@ impl ToduLocalDatabase {
 
 /// Sorts a tree of todos by status, priority, then `ptid`, recursively
 fn sort_tree(tasks: &mut [ToduRow]) {
-    tasks.sort_by_key(|t| (std::cmp::Reverse(t.status), std::cmp::Reverse(t.priority), t.ptid));
+    tasks.sort_by_key(|t| {
+        (
+            std::cmp::Reverse(t.status),
+            std::cmp::Reverse(t.priority),
+            t.ptid,
+        )
+    });
     for task in tasks.iter_mut() {
         sort_tree(&mut task.subtasks);
+    }
+}
+
+/// Sorts a tree of todos by descending urgency, then `ptid`, recursively
+pub fn sort_tree_by_urgency(tasks: &mut [ToduRow]) {
+    tasks.sort_by(|a, b| b.urgency.total_cmp(&a.urgency).then(a.ptid.cmp(&b.ptid)));
+    for task in tasks.iter_mut() {
+        sort_tree_by_urgency(&mut task.subtasks);
     }
 }
 
@@ -492,6 +544,8 @@ mod tests {
             tag: None,
             branch: None,
             source: ToduSource::Local,
+            impact: None,
+            urgency: 0.0,
             subtasks: vec![],
         }
     }
