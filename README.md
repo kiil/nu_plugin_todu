@@ -48,7 +48,7 @@ plugin use todu
 
 ### Requirements
 
-- Nushell 0.115+
+- Nushell 0.116+
 - Rust toolchain (for building from source)
 
 ## Urgency
